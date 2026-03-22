@@ -153,8 +153,8 @@ class TestBuildConfigValues:
         assert cfg["fp16"] is True
         assert cfg["wlasl_variant"] == 100
         assert cfg["d_model"] == 128
-        assert cfg["label_smoothing"] == 0.0
-        assert cfg["mixup_alpha"] == 0.0
+        assert cfg["label_smoothing"] == 0.1
+        assert cfg["mixup_alpha"] == 0.2
         assert cfg["head_dropout"] == 0.2
 
     def test_stgcn_ce_cpu(self, cpu_hw):
@@ -214,7 +214,7 @@ class TestRenderYaml:
         parsed = yaml.safe_load(content)
         assert isinstance(parsed, dict)
         assert parsed["approach"] == "stgcn_ce"
-        assert parsed["label_smoothing"] == 0.0
+        assert parsed["label_smoothing"] == 0.1
 
     def test_stgcn_proto_valid_yaml(self, cuda_hw):
         values = auto_config.build_config_values("stgcn_proto", 100, "mid", cuda_hw)

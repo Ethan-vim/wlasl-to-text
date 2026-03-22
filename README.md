@@ -46,6 +46,7 @@
   - [MediaPipe installation issues](#mediapipe-installation-issues) — Line 924
   - [CUDA out of memory](#cuda-out-of-memory) — Line 936
   - [Webcam not detected](#webcam-not-detected) — Line 942
+  - ["No body detected" warning in live demo](#no-body-detected-warning-in-live-demo)
   - [Low accuracy](#low-accuracy) — Line 948
   - [Diagnosing partial data](#diagnosing-partial-data-most-common-issue) — Line 953
   - [wlasl_variant / num_classes mismatch](#wlasl_variant--num_classes-mismatch) — Line 1000
@@ -574,7 +575,13 @@ python -m src.inference.live_demo `
 
 The demo runs three threads: a capture thread reads webcam frames continuously, an inference thread runs the model when a sign is detected as complete, and the main thread renders the overlay. Predictions are smoothed over the last 5 inference windows and only displayed when confidence exceeds the configured threshold (default: 0.6).
 
-**Motion-aware sign detection:** The demo uses a `MotionDetector` that tracks hand keypoint velocity to detect when a sign starts and ends. The status bar shows the current state: `IDLE` (waiting for motion), `SIGNING` (motion in progress), or `COMPLETED` (sign finished, running inference). Predictions only fire after sign completion, when the buffer is full, or after a static sign timeout (for held handshapes like fingerspelled letters). After a confident prediction, the buffer is cleared and a cooldown period prevents re-predicting the same sign.
+**Motion-aware sign detection:** The demo uses a `MotionDetector` that tracks hand keypoint velocity to detect when a sign starts and ends. The detector is **fully FPS-independent**: it measures real time between frames via `time.monotonic()` and converts displacement into velocity in normalized-coordinates per second, so the same thresholds work identically on 30fps, 60fps, or any other camera rate. The status bar shows the current state: `IDLE` (waiting for motion), `SIGNING` (motion in progress), or `COMPLETED` (sign finished, running inference).
+
+**Inference only triggers on COMPLETED state** (the full `IDLE` -> `SIGNING` -> `COMPLETED` transition). The detector enters `SIGNING` when hand velocity exceeds `motion_start_threshold` (0.30 norm-coords/sec), then transitions to `COMPLETED` either when velocity drops below `motion_end_threshold` (0.10 norm-coords/sec) for `motion_settle_time` (0.27s) or when `max_sign_duration` (3.0s) elapses. High-confidence predictions commit to the display and enter a full cooldown. Low-confidence results still display but use a shorter cooldown (30% of `prediction_cooldown`) so the user can retry sooner.
+
+**Buffer management:** The buffer is sized dynamically from the camera FPS (`max_sign_duration * camera_fps + 10`) rather than a fixed `buffer_size` value, ensuring the buffer can hold the full sign duration regardless of camera frame rate. When the motion detector transitions from `IDLE` to `SIGNING`, the buffer is trimmed to keep only the most recent `pre_sign_duration` seconds of frames (default 0.5s). This "pre-trigger buffer" preserves the sign's preparation phase (the hand movement ramp-up that precedes the velocity threshold) while discarding old idle frames. The training data includes full video clips with preparation frames, so preserving sign onset in the live buffer keeps inference data consistent with what the model was trained on.
+
+**Pose quality gate:** Before running the model, `predict_buffer` checks that at least 30% of buffered frames have valid shoulder landmarks. If fewer than 30% pass, inference is skipped entirely and returns `None`, preventing garbage predictions from low-quality pose data. A red "No body detected" warning is shown on the display when MediaPipe cannot detect pose landmarks in the current frame.
 
 **Confidence scaling:** Predictions from partially-filled buffers have their confidence scaled by the buffer fill ratio (`real_frames / T`), so incomplete signs naturally fall below the confidence threshold.
 
@@ -666,7 +673,7 @@ python -m src.inference.export_onnx `
 
 ```bash
 source .venv/bin/activate
-python -m pytest                          # full test suite (286 tests)
+python -m pytest                          # full test suite (317 tests)
 python -m pytest tests/test_augment.py    # specific test file
 python -m pytest tests/test_dependencies.py  # dependency compatibility tests
 python -m pytest -q                       # quiet output
@@ -682,7 +689,7 @@ Or without activating the venv:
 
 ```powershell
 .venv\Scripts\Activate.ps1
-python -m pytest                          # full test suite (286 tests)
+python -m pytest                          # full test suite (317 tests)
 python -m pytest tests\test_augment.py    # specific test file
 python -m pytest -q                       # quiet output
 ```
@@ -855,13 +862,18 @@ Windows (PowerShell / Command Prompt): the commands are identical — just run t
 | Parameter       | Description                                                                                           | Default            |
 | --------------- | ----------------------------------------------------------------------------------------------------- | ------------------ |
 | `approach`              | `stgcn_ce` or `stgcn_proto`                                                                    | `stgcn_ce`         |
-| `num_keypoints`         | Number of MediaPipe landmarks per frame (33 pose + 21 left hand + 21 right hand + 468 face)    | `543`              |
+| `num_keypoints`         | Number of landmarks per frame after face drop (33 pose + 21 left hand + 21 right hand)         | `75`               |
 | `d_model`               | ST-GCN embedding dimension (auto-scaled per variant: 128/192/256/384 for 100/300/1000/2000)    | `128`              |
+| `embedding_dim`         | Final embedding dimension output by the ST-GCN encoder                                         | `128`              |
+| `gcn_channels`          | Channel widths for each ST-GCN block (list of ints)                                            | `[64, 128, 128]`   |
 | `nhead`                 | Number of attention heads (auto-scaled per variant: 4/6/8/8 for 100/300/1000/2000)             | `4`                |
 | `num_layers`            | Number of encoder layers (auto-scaled per variant: 2/4/5/6 for 100/300/1000/2000)              | `2`                |
 | `dropout`               | Dropout rate (auto-scaled per variant: 0.1/0.3/0.4/0.5 for 100/300/1000/2000)                 | `0.5`              |
 | `use_motion`            | Concatenate velocity (frame differences) with position features                                 | `true`             |
 | `normalize_embeddings`  | L2-normalize encoder embeddings (`true` for proto distance-based, `false` for CE logit-based)  | `true`             |
+| `use_attention_pool`    | Attention-weighted temporal pooling (replaces global average pool)                              | `false`            |
+| `drop_path_rate`        | Stochastic depth drop rate per ST-GCN block (0 = disabled)                                     | `0.0`              |
+| `use_cross_attention`   | Cross-branch attention fusion between body/hand branches                                        | `false`            |
 
 
 **Training:**
@@ -874,15 +886,16 @@ Windows (PowerShell / Command Prompt): the commands are identical — just run t
 | `lr`                      | Learning rate                                                    | `3e-4`     |
 | `weight_decay`            | AdamW weight decay                                               | `5e-4`     |
 | `warmup_epochs`           | Linear warmup epochs before scheduler takes over                 | `15`       |
-| `label_smoothing`         | Label smoothing for cross-entropy loss (0 = disabled)            | `0.0`      |
+| `label_smoothing`         | Label smoothing for cross-entropy loss (0 = disabled)            | `0.1`      |
 | `grad_clip`               | Max gradient norm for clipping                                   | `1.0`      |
 | `fp16`                    | Mixed-precision (FP16) training                                  | `true`     |
 | `weighted_sampling`       | Weighted sampler to counter class imbalance                      | `false`    |
 | `early_stopping_patience` | Epochs without val improvement before stopping                   | `50`       |
-| `mixup_alpha`             | Mixup interpolation strength (0 = disabled)                      | `0.0`      |
+| `mixup_alpha`             | Mixup interpolation strength (0 = disabled)                      | `0.2`      |
 | `head_dropout`            | Dropout before classification head (CE approach)                 | `0.2`      |
 | `class_weighted_loss`     | Inverse-frequency class weights in CE loss (prevents class collapse) | `true`  |
-| `scheduler`               | LR scheduler: `onecycle` or `cosine` (warmup + cosine annealing) | `cosine`   |
+| `scheduler`               | LR scheduler: `onecycle` (per-batch) or `cosine` (per-epoch warmup + cosine annealing) | `onecycle` |
+| `aux_loss_weight`         | Weight for auxiliary branch classification losses (0 = disabled) | `0.0`      |
 
 
 **Evaluation:**
@@ -900,22 +913,22 @@ Windows (PowerShell / Command Prompt): the commands are identical — just run t
 | ---------------------- | ------------------------------------------------------ | ------- |
 | `confidence_threshold` | Minimum confidence for live display                    | `0.6`   |
 | `smoothing_window`     | Number of inference windows to smooth predictions over | `5`     |
-| `buffer_size`          | Rolling frame buffer size for live demo                | `64`    |
 | `fps_display`          | Show FPS counter on live demo overlay                  | `true`  |
 
 **Sign Detection (Live Demo):**
 
+All motion thresholds are in **normalized-coordinates per second**, making them fully FPS-independent. The `MotionDetector` measures real time between frames via `time.monotonic()` and converts displacement to velocity, so the same config works on any camera frame rate.
 
 | Parameter                 | Description                                                    | Default |
 | ------------------------- | -------------------------------------------------------------- | ------- |
 | `min_buffer_frames`       | Minimum real frames before prediction (~1s at 30fps)           | `30`    |
-| `prediction_cooldown`     | Seconds to wait after a confident prediction before next       | `1.0`   |
-| `motion_start_threshold`  | Hand velocity threshold to detect sign start                   | `0.005` |
-| `motion_end_threshold`    | Hand velocity threshold to detect sign end                     | `0.003` |
-| `motion_settle_frames`    | Consecutive low-velocity frames to confirm sign end            | `8`     |
-| `max_sign_duration`       | Max frames before forcing sign completion (~3s at 30fps)       | `90`    |
-| `static_sign_timeout`     | Idle frames with buffer data before allowing static prediction | `45`    |
+| `prediction_cooldown`     | Seconds to wait after a confident prediction before next (low-confidence uses 30% of this value) | `1.0`   |
+| `motion_start_threshold`  | Hand velocity to detect sign start (norm-coords/sec) -- requires deliberate hand movement | `0.30`  |
+| `motion_end_threshold`    | Hand velocity to detect sign end (norm-coords/sec) -- detects when signing stops | `0.10`  |
+| `motion_settle_time`      | Seconds of low velocity to confirm sign end                    | `0.27`  |
+| `max_sign_duration`       | Maximum sign length in seconds before forcing completion       | `3.0`   |
 | `inference_poll_interval` | Seconds between inference loop state checks                    | `0.1`   |
+| `pre_sign_duration`       | Seconds of pre-sign frames to retain when signing starts (preserves sign onset for model accuracy) | `0.5`   |
 
 
 **Logging:**
@@ -955,7 +968,7 @@ Dropout is intentionally low for smaller variants: a tiny model (d_model=128, 2 
 
 ### ST-GCN Encoder (Shared)
 
-MediaPipe Holistic extracts 543 landmarks per frame (33 pose + 21 left hand + 21 right hand + 468 face), centered on the shoulder midpoint and scaled by shoulder width. Hand landmarks are further normalized relative to their respective wrist, reducing noise from absolute wrist movement. When `use_motion: true` (default), frame-to-frame velocity is concatenated with position, producing 6 features per keypoint `(x, y, z, dx, dy, dz)`.
+MediaPipe Holistic extracts 543 landmarks per frame (33 pose + 21 left hand + 21 right hand + 468 face), centered on the shoulder midpoint and scaled by shoulder width. At load time, face landmarks are dropped, keeping only the first 75 keypoints (pose + hands). Hand landmarks are further normalized relative to their respective wrist, reducing noise from absolute wrist movement. When `use_motion: true` (default), frame-to-frame velocity is concatenated with position, producing 6 features per keypoint `(x, y, z, dx, dy, dz)`.
 
 The ST-GCN encoder processes keypoints through separate body (33 landmarks) and hand (21+21 landmarks) graph convolution branches, then fuses them into a single embedding vector.
 
@@ -1056,6 +1069,14 @@ RuntimeError: User specified an unsupported autocast device_type 'mps'
 - macOS: grant camera access in System Settings → Privacy & Security → Camera.
 - Windows: check Device Manager → Cameras. Grant camera access in Settings → Privacy & security → Camera.
 
+### "No body detected" warning in live demo
+
+The live demo displays a red "No body detected - adjust position/lighting" warning when MediaPipe cannot detect pose landmarks in the current frame. Additionally, `predict_buffer` applies a pose detection quality gate: if fewer than 30% of buffered frames have valid shoulder landmarks, inference is skipped entirely and returns `None`. This prevents garbage predictions from low-quality pose data. To resolve:
+
+- Improve lighting -- avoid strong backlighting or very dim environments.
+- Move closer to the camera so your upper body is clearly visible.
+- Reduce occlusion -- ensure your torso and shoulders are not blocked.
+
 ### Low accuracy
 
 - Check split CSV row counts to ensure enough training videos were downloaded.
@@ -1130,8 +1151,8 @@ wlasl_variant: 100
 T: 64
 use_motion: true               # velocity features (position + frame differences)
 normalize_embeddings: false    # CRITICAL for CE — do not enable
-label_smoothing: 0.0           # disabled (counterproductive with ~8 samples/class)
-mixup_alpha: 0.0               # disabled (counterproductive with ~8 samples/class)
+label_smoothing: 0.1           # mild smoothing for regularization
+mixup_alpha: 0.2               # mixup augmentation for regularization
 head_dropout: 0.2              # dropout in two-layer classification head
 batch_size: 32
 lr: 1.0e-3
@@ -1258,14 +1279,14 @@ WLASL's expired URLs mean you may only get 30–60% of the annotated videos. Whe
 1. **Enable weighted sampling** (`weighted_sampling: true`) — ensures every class is seen equally despite imbalance.
 2. **Use smaller batch sizes** (8–16) so the model sees more update steps per epoch.
 3. **Try prototypical training** (`approach: stgcn_proto`) — designed for few-shot scenarios with ~3-8 samples/class.
-4. **Keep label smoothing and mixup disabled** (`label_smoothing: 0.0`, `mixup_alpha: 0.0`) — counterproductive with small datasets.
+4. **Consider reducing label smoothing and mixup** (`label_smoothing: 0.0`, `mixup_alpha: 0.0`) if your dataset is very small (<100 samples).
 5. **Download from Kaggle** (`python scripts/download_kaggle.py`) — the full ~12K video archive is available as a single download.
 
 ### Improving Accuracy
 
 - **Start with `stgcn_ce` (recommended)** — our best model. It trains fastest and is easiest to debug.
 - **Enable motion features** (`use_motion: true`) — velocity information captures signing dynamics and typically adds 5–8% accuracy.
-- **Disable label smoothing and mixup** for small datasets — they are counterproductive with ~8 samples/class.
+- **Reduce or disable label smoothing and mixup** for very small datasets — they can be counterproductive with fewer than ~100 total samples.
 - **Set `normalize_embeddings: false` for CE** — L2 normalization caps logit magnitudes and causes loss plateaus.
 - **Enable TTA for evaluation** (`use_tta: true`) — averages predictions over original + horizontally flipped input for 2–4% evaluation boost.
 - **Use the error analysis notebook** (`notebooks/03_error_analysis.ipynb`) to find which classes are confused, then inspect those videos manually.

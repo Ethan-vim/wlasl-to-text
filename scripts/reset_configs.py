@@ -30,7 +30,7 @@ STGCN_CE_YAML = """\
 
 approach: stgcn_ce
 wlasl_variant: 100
-num_keypoints: 543
+num_keypoints: 75
 T: 64
 use_motion: true
 use_augmentation: true
@@ -41,11 +41,15 @@ gcn_channels: [64, 128, 128]
 num_layers: 3
 dropout: 0.1
 embedding_dim: 128
+use_attention_pool: false
+drop_path_rate: 0.0
+use_cross_attention: false
+aux_loss_weight: 0.0
 normalize_embeddings: false
 
 # Cross-entropy training
-label_smoothing: 0.0
-mixup_alpha: 0.0
+label_smoothing: 0.1
+mixup_alpha: 0.2
 head_dropout: 0.2
 class_weighted_loss: true
 
@@ -59,8 +63,11 @@ grad_clip: 1.0
 fp16: false
 weighted_sampling: true
 early_stopping_patience: 30
-scheduler: cosine
+scheduler: onecycle
 num_workers: 4
+
+# Evaluation
+use_tta: true
 
 # Logging
 use_wandb: false
@@ -97,7 +104,7 @@ STGCN_PROTO_YAML = """\
 
 approach: stgcn_proto
 wlasl_variant: 100
-num_keypoints: 543
+num_keypoints: 75
 T: 64
 use_motion: true
 
@@ -106,6 +113,8 @@ d_model: 128
 gcn_channels: [64, 128, 128]
 num_layers: 3
 dropout: 0.1
+use_attention_pool: false
+drop_path_rate: 0.0
 normalize_embeddings: true
 
 # Prototypical training
@@ -127,7 +136,7 @@ scheduler: cosine
 num_workers: 4
 
 # Evaluation
-use_tta: false
+use_tta: true
 
 # Logging
 use_wandb: false

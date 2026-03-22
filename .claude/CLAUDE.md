@@ -20,7 +20,7 @@ Uses **ST-GCN + Prototypical Network** — a spatiotemporal graph convolutional 
 - **Python 3.12** (virtual env in `.venv`)
 - Activate: `source .venv/bin/activate` (Linux/macOS) or `.venv\Scripts\Activate.ps1` (Windows)
 - Install: `pip install -r requirements.txt`
-- Tests: `python -m pytest` (285 tests, fully isolated via `tmp_path`)
+- Tests: `python -m pytest` (317 tests across 12 test files, fully isolated via `tmp_path`)
 
 ## Key Files to Read Before Editing
 
@@ -66,7 +66,7 @@ scripts/
     auto_config.py        Auto-detect hardware, generate optimized YAML config
     reset_configs.py      Reset configs/ to README defaults
     check_mediapipe.py    Diagnose MediaPipe installation issues
-tests/                    285 tests across 11 test files + conftest.py (all isolated)
+tests/                    317 tests across 12 test files + conftest.py (all isolated)
 ```
 
 ## Pipeline Summary
@@ -87,3 +87,8 @@ download (Kaggle/URL) -> validate_videos -> preprocess (keypoints/frames)
 - **TTA** (`use_tta: true`) averages predictions over original + horizontally flipped input — see `_flip_keypoints_tensor()` in `evaluate.py`
 - **Multiprocessing** uses `spawn` context (not `fork`) to avoid MediaPipe crashes on macOS
 - All split CSVs live under `data/splits/WLASL{N}/` — multiple variants coexist without conflict
+- **Face landmark dropping**: Dataset slices 543 keypoints to 75 at load time (33 body + 21 left hand + 21 right hand), dropping unused face landmarks
+- **Reflection padding**: Short sequences are padded by mirroring backwards (not repeating last frame), preserving non-zero velocity in padded region
+- **Dilated temporal convolutions**: ST-GCN blocks use exponentially increasing dilation [1, 2, 4] for wider receptive field (~57 frames)
+- **Joint importance**: Learnable per-joint parameter in each ST-GCN branch, applied before pooling
+- **Optional features** (disabled by default, enable in config): `use_attention_pool` (attention-weighted temporal pooling), `drop_path_rate` (stochastic depth), `use_cross_attention` (cross-branch attention fusion), `aux_loss_weight` (auxiliary per-branch classification heads)

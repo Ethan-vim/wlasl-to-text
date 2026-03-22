@@ -44,6 +44,12 @@ class Config:
     nhead: int = 4
     num_layers: int = 3
     dropout: float = 0.5
+    embedding_dim: int = 128  # Final embedding dimension for ST-GCN encoder
+    gcn_channels: list[int] = field(default_factory=lambda: [64, 128, 128])  # ST-GCN channel widths
+    use_attention_pool: bool = False  # Use attention-weighted temporal pooling
+    drop_path_rate: float = 0.0  # Stochastic depth drop rate (0 = disabled)
+    use_cross_attention: bool = False  # Cross-branch attention fusion
+    aux_loss_weight: float = 0.0  # Auxiliary branch loss weight (0 = disabled)
 
     # Fusion-specific
     fusion: str = "concat"  # concat or attention
@@ -83,19 +89,22 @@ class Config:
 
     # --- Inference ---
     confidence_threshold: float = 0.6
-    smoothing_window: int = 5
+    smoothing_window: int = 1
     buffer_size: int = 64
     fps_display: bool = True
 
     # --- Inference (sign detection) ---
+    # Thresholds are in normalized-coordinates per second (FPS-independent).
+    # MotionDetector measures actual frame timing to convert displacement/frame
+    # to velocity/second, so these work identically on 30fps and 60fps cameras.
     min_buffer_frames: int = 30  # Minimum real frames before prediction
     prediction_cooldown: float = 1.0  # Seconds to wait after a confident prediction
-    motion_start_threshold: float = 0.005  # Hand velocity to detect sign start
-    motion_end_threshold: float = 0.003  # Hand velocity to detect sign end
-    motion_settle_frames: int = 8  # Low-velocity frames to confirm sign end
-    max_sign_duration: int = 90  # Max frames before forcing sign completion (~3s at 30fps)
-    static_sign_timeout: int = 45  # Idle frames with buffer data before static prediction
+    motion_start_threshold: float = 0.30  # Hand velocity (norm-coords/sec) to start — requires deliberate movement
+    motion_end_threshold: float = 0.10  # Hand velocity (norm-coords/sec) to detect sign end
+    motion_settle_time: float = 0.27  # Seconds of low velocity to confirm sign end
+    max_sign_duration: float = 3.0  # Seconds before forcing sign completion
     inference_poll_interval: float = 0.1  # Seconds between inference loop checks
+    pre_sign_duration: float = 0.5  # Seconds of pre-sign context to retain on IDLE->SIGNING
 
     # --- Resume ---
     resume_checkpoint: Optional[str] = None

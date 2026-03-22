@@ -72,6 +72,14 @@ class TestConfigDefaults:
         cfg = Config()
         assert cfg.normalize_embeddings is True
 
+    def test_new_accuracy_config_fields(self):
+        """Config has new accuracy improvement fields with correct defaults."""
+        cfg = Config()
+        assert cfg.use_attention_pool is False
+        assert cfg.drop_path_rate == 0.0
+        assert cfg.use_cross_attention is False
+        assert cfg.aux_loss_weight == 0.0
+
 
 class TestLoadConfig:
     def test_load_minimal(self, tmp_path):

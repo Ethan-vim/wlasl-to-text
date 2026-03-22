@@ -8,7 +8,7 @@ from src.models import build_model
 from src.training.config import Config
 
 
-NUM_KP = 543
+NUM_KP = 75  # Model expects 75 keypoints (predict.py slices 543->75 at inference time)
 
 
 class TestPredictFromKeypoints:

@@ -100,7 +100,7 @@ Shows which project files each module imports from (`src.*` imports only).
 | `scripts/validate_videos.py` | Detect and remove fake HTML video files | (none) | Cleaned `data/raw/` |
 | `scripts/reset_configs.py` | Reset YAML configs to README defaults | (none) | `configs/*.yaml` |
 | `scripts/check_mediapipe.py` | Verify MediaPipe installation, diagnose `solutions` import issues | (none) | Diagnostic output to stdout |
-| `scripts/auto_config.py` | Auto-detect hardware (CUDA/MPS/CPU) and generate optimized configs | (none) | `configs/*.yaml` |
+| `scripts/auto_config.py` | Auto-detect hardware (CUDA/MPS/CPU) and generate optimized configs (CE and proto both include `use_cross_attention`, `aux_loss_weight`) | (none) | `configs/*.yaml` |
 
 ### Data Pipeline (`src/data/`)
 
@@ -115,8 +115,8 @@ Shows which project files each module imports from (`src.*` imports only).
 | Module | Key Classes | Build Function | Approaches |
 |--------|-------------|----------------|------------|
 | `__init__.py` | — | `build_model(cfg)` | Unified factory dispatching on `cfg.approach` |
-| `stgcn.py` | `STGCNEncoder` | `build_stgcn_encoder(cfg)` | ST-GCN encoder with body/hand graph branches, conditional L2 normalization |
-| `classifier.py` | `STGCNClassifier` | `build_classifier(cfg)` | ST-GCN encoder + two-layer head (stgcn_ce) |
+| `stgcn.py` | `STGCNEncoder`, `DropPath`, `AttentionPool`, `CrossBranchAttention` | `build_stgcn_encoder(cfg)`, `forward_with_branches()` | ST-GCN encoder with body/hand graph branches, dilated TCN, joint importance weighting, optional attention pooling, stochastic depth, and cross-branch attention |
+| `classifier.py` | `STGCNClassifier` | `build_classifier(cfg)`, `forward_with_aux()` | ST-GCN encoder + two-layer head + optional auxiliary branch heads (stgcn_ce) |
 | `prototypical.py` | `PrototypicalNetwork` | — | Prototypical network wrapper for few-shot (stgcn_proto) |
 
 The unified `build_model(cfg)` factory in `__init__.py` dispatches on `cfg.approach` to the correct model builder. All `build_*_model()` functions take a `Config` object and return an `nn.Module`.
@@ -125,9 +125,9 @@ The unified `build_model(cfg)` factory in `__init__.py` dispatches on `cfg.appro
 
 | Module | Key Functions | Imports From |
 |--------|---------------|--------------|
-| `config.py` | `Config` (dataclass), `load_config()`, `save_config()` | (none — leaf dependency) |
+| `config.py` | `Config` (dataclass with `embedding_dim`, `gcn_channels`, etc.), `load_config()`, `save_config()` | (none — leaf dependency) |
 | `train.py` | `main()` — CLI dispatcher | `config`, `train_ce`, `train_prototypical` |
-| `train_ce.py` | `train_ce()` — standard cross-entropy training loop with label smoothing + mixup | `config`, `augment`, `dataset`, `models` |
+| `train_ce.py` | `train_one_epoch()`, `validate()`, `main()` — cross-entropy training with label smoothing, mixup, OneCycleLR/cosine scheduler, and optional auxiliary branch losses | `config`, `augment`, `dataset`, `models` |
 | `train_prototypical.py` | `train_prototypical()` — episodic prototypical training loop | `config`, `augment`, `dataset`, `episode_sampler`, `models` |
 | `evaluate.py` | `compute_metrics()`, `plot_confusion_matrix()`, `find_hard_negatives()`, `evaluate_latency()`, `main()` | `config`, `augment`, `dataset`, `models` |
 
@@ -136,7 +136,7 @@ The unified `build_model(cfg)` factory in `__init__.py` dispatches on `cfg.appro
 | Module | Key Classes / Functions | Imports From |
 |--------|------------------------|--------------|
 | `predict.py` | `SignPredictor`, `_load_class_names()` | `config`, `augment`, `preprocess`, `models` |
-| `live_demo.py` | `FrameBuffer`, `MotionDetector`, `LivePredictor`, `ASLDisplay`, `run_demo()` | `config`, `preprocess`, `models` |
+| `live_demo.py` | `FrameBuffer`, `MotionDetector`, `LivePredictor`, `ASLDisplay`, `run_demo()` — FPS-independent motion detection via time-based velocity (displacement/dt), pre-trigger buffering (retains sign onset frames on IDLE→SIGNING), pose quality gate (skips inference if <30% valid shoulder frames), and "No body detected" display warning | `config`, `preprocess`, `models` |
 | `export_onnx.py` | `export_to_onnx()`, `verify_onnx()`, `benchmark_onnx()` | `config`, `models` |
 
 ---
@@ -168,8 +168,9 @@ data/processed/*.npy + data/splits/WLASL{N}/train.csv
   │  WLASLKeypointDataset           │
   │    __getitem__():               │
   │      load .npy                  │
-  │      pad/crop to T frames      │
-  │      compute velocity (motion)  │  ──> (T, 543*6) when use_motion=True
+  │      slice to 75 keypoints     │  (drop face landmarks)
+  │      pad/crop to T frames      │  (reflection padding)
+  │      compute velocity (motion)  │  ──> (T, 75*6) when use_motion=True
   │      apply augmentations        │  (incl. KeypointYawRotation for 3D viewpoint simulation)
   │
   │      flatten to (T, input_dim)  │
@@ -202,18 +203,32 @@ Single Video (predict.py):
 
 Live Demo (live_demo.py):
 
-  Webcam ──> MediaPipe ──> FrameBuffer(T=64) ──> MotionDetector
+  Webcam ──> MediaPipe ──> MotionDetector ──> FrameBuffer(max_sign_duration * camera_fps + 10)
     │                           │                      │
+    │                   FPS-independent:               │
+    │                   velocity = displacement/dt     │
+    │                   (dt via time.monotonic())       │
+    │                           │                      │
+    │                           │  IDLE→SIGNING: trim buffer to pre_sign_frames (keep sign onset)
     │                           │              state: IDLE/SIGNING/COMPLETED
     │                           │                      │
-    │                           │              [sign complete OR buffer full OR static timeout]
+    │                           │              inference only on COMPLETED:
+    │                           │              ├─ settle_time elapsed ──> COMPLETED
+    │                           │              └─ max_sign_duration   ──> COMPLETED
     │                           │                      │
     │                           v                      v
-    │                     normalize ──> pad/crop ──> confidence scaling ──> model
-    │                                                                        │
-    v                                                                        v
+    │                     pose quality gate: skip if <30% of buffer
+    │                     frames have valid shoulder landmarks
+    │                           │ (pass)
+    │                           v
+    │                     normalize ──> TemporalCrop(T) ──> model ──> prediction
+    │                     (full sign frames: TemporalCrop uniformly
+    │                      samples to T, matching training pipeline)
+    │                                                           │
+    v                                                           v
   Display <───── overlay predicted gloss + confidence + motion state
-                 (smoothed over 5 windows, cooldown after prediction)
+                 (high-conf: full cooldown, low-conf: 30% cooldown)
+                 Shows "No body detected" warning when pose_landmarks is None
 
 
 ONNX Export (export_onnx.py):
@@ -227,7 +242,7 @@ ONNX Export (export_onnx.py):
 ### Model Architecture Flow (ST-GCN)
 
 ```
-Input: (batch, T, input_dim)     input_dim = 543*3 or 543*6 (with motion)
+Input: (batch, T, input_dim)     input_dim = 75*3 or 75*6 (with motion)
               │
               v
     ┌──────────────────────────┐
@@ -238,17 +253,22 @@ Input: (batch, T, input_dim)     input_dim = 543*3 or 543*6 (with motion)
     v         v         v
   ┌──────┐ ┌──────┐ ┌──────┐
   │ Body │ │ Left │ │Right │     Separate graph convolution branches
-  │ GCN  │ │ Hand │ │ Hand │     with adjacency matrices
+  │ GCN  │ │ Hand │ │ Hand │     with dilated TCN, DropPath, joint importance
   │(33kp)│ │(21kp)│ │(21kp)│
   └──┬───┘ └──┬───┘ └──┬───┘
      └─────────┼─────────┘
                v
     ┌─────────────────────┐
-    │  Concat + Project   │  Fuse branch outputs
+    │  Avg Pool or        │  Pool over time+joints per branch
+    │  AttentionPool      │  (optional attention-weighted temporal pooling)
     └─────────┬───────────┘
               v
     ┌─────────────────────┐
-    │  Global Avg Pool    │  (T, d_model) -> (d_model,)
+    │  CrossBranchAttn?   │  Optional cross-branch attention fusion
+    └─────────┬───────────┘
+              v
+    ┌─────────────────────┐
+    │  Concat + Project   │  Fuse branch outputs
     └─────────┬───────────┘
               v
     ┌─────────────────────┐
@@ -282,6 +302,10 @@ Config.__post_init__() auto-derives (scales with variant size):
     wlasl_variant: 1000 ──>  num_classes: 1000, d_model: 256, nhead: 8, num_layers: 5, dropout: 0.4
     wlasl_variant: 2000 ──>  num_classes: 2000, d_model: 384, nhead: 8, num_layers: 6, dropout: 0.5
     Note: d_model, nhead, num_layers, dropout are auto-scaled per variant.
+
+YAML-configurable model fields (read by load_config into Config dataclass):
+    embedding_dim: 128          # Final embedding dimension for ST-GCN encoder
+    gcn_channels: [64, 128, 128]  # Channel widths per ST-GCN block
 ```
 
 ---
@@ -297,8 +321,8 @@ Each test file maps to one or more source modules:
 | `test_dataset.py` | `src/data/dataset.py` — Dataset, DataLoader, pad/crop, motion features |
 | `test_evaluate.py` | `src/training/evaluate.py` — metrics, TTA, hard negatives, latency |
 | `test_export_onnx.py` | `src/inference/export_onnx.py` — ONNX export and verification |
-| `test_live_demo.py` | `src/inference/live_demo.py` — FrameBuffer, MotionDetector, prediction smoothing |
-| `test_models.py` | `src/models/` — STGCNEncoder, STGCNClassifier, PrototypicalNetwork, normalize_embeddings |
+| `test_live_demo.py` | `src/inference/live_demo.py` — FrameBuffer, MotionDetector (FPS-independent, time-based velocity), prediction smoothing |
+| `test_models.py` | `src/models/` — STGCNEncoder, STGCNClassifier, PrototypicalNetwork, normalize_embeddings, DropPath, AttentionPool, CrossBranchAttention, auxiliary heads, 75-keypoint models |
 | `test_predict.py` | `src/inference/predict.py` — SignPredictor inference paths |
 | `test_preprocess.py` | `src/data/preprocess.py` — normalization, annotation parsing, splits |
 | `test_train.py` | `src/training/train.py` — accuracy, mixup helpers |

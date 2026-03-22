@@ -108,6 +108,9 @@ class WLASLKeypointDataset(Dataset):
         npy_path = self.keypoint_dir / f"{video_id}.npy"
         keypoints = np.load(str(npy_path))  # (T_var, 543, 3)
 
+        # Drop face landmarks: keep only pose (33) + left hand (21) + right hand (21) = 75
+        keypoints = keypoints[:, :75, :]
+
         if self.transform is not None:
             keypoints = self.transform(keypoints)
 
@@ -142,9 +145,22 @@ class WLASLKeypointDataset(Dataset):
         if T_in >= self.T:
             indices = np.linspace(0, T_in - 1, self.T, dtype=np.int64)
             return keypoints[indices]
-        # Pad
+        # Reflection padding: mirror the sequence backwards to fill
         pad_count = self.T - T_in
-        padding = np.tile(keypoints[-1:], (pad_count, *([1] * (keypoints.ndim - 1))))
+        reflect_indices = []
+        idx = T_in - 2  # start from second-to-last frame
+        direction = -1
+        for _ in range(pad_count):
+            idx = max(0, min(T_in - 1, idx))
+            reflect_indices.append(idx)
+            idx += direction
+            if idx < 0:
+                idx = 1
+                direction = 1
+            elif idx >= T_in:
+                idx = T_in - 2
+                direction = -1
+        padding = keypoints[reflect_indices]
         return np.concatenate([keypoints, padding], axis=0)
 
 

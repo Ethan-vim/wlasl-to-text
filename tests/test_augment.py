@@ -71,8 +71,8 @@ class TestTemporalCrop:
         kps = _kps(T=10)
         result = TemporalCrop(T=64)(kps)
         assert result.shape == (64, NUM_KP, 3)
-        # Last 54 frames should be copies of frame 9
-        np.testing.assert_array_equal(result[10], result[9])
+        # Reflection padding: frame 10 mirrors back to frame 8 (second-to-last)
+        np.testing.assert_array_equal(result[10], kps[8])
 
     def test_empty_input(self):
         kps = np.zeros((0, NUM_KP, 3), dtype=np.float32)
@@ -450,3 +450,20 @@ class TestCETrainTransforms:
                 break
         else:
             pytest.fail("KeypointDropout not found in CE pipeline")
+
+
+# ---------------------------------------------------------------------------
+# TemporalCrop reflection padding
+# ---------------------------------------------------------------------------
+
+
+class TestTemporalCropReflection:
+    def test_reflection_padding(self):
+        """TemporalCrop uses reflection padding for short sequences."""
+        crop = TemporalCrop(T=30)
+        kps = _kps(T=10)  # shorter than target
+        result = crop(kps)
+        assert result.shape[0] == 30
+        # Padded frames should mirror (not repeat last frame)
+        # Frame at index 10 should be frame 8 (reflection from second-to-last)
+        np.testing.assert_array_equal(result[10], kps[8])

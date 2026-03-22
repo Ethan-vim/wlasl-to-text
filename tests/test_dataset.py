@@ -10,7 +10,7 @@ from src.data.dataset import (
     get_dataloader,
 )
 
-NUM_KP = 543
+NUM_KP = 75  # Dataset slices 543 -> 75 at load time (pose + hands, no face)
 
 
 # ---------------------------------------------------------------------------
@@ -51,8 +51,8 @@ class TestPadOrCrop:
         kps = np.random.rand(10, NUM_KP, 3).astype(np.float32)
         result = ds._pad_or_crop(kps)
         assert result.shape == (16, NUM_KP, 3)
-        # Padding should duplicate last frame
-        np.testing.assert_array_equal(result[10], result[9])
+        # Reflection padding: frame 10 mirrors back to frame 8 (second-to-last)
+        np.testing.assert_array_equal(result[10], kps[8])
 
     def test_empty_input(self, tmp_path):
         ds = self._make_ds(tmp_path)
@@ -60,6 +60,51 @@ class TestPadOrCrop:
         result = ds._pad_or_crop(kps)
         assert result.shape == (16, NUM_KP, 3)
         assert np.all(result == 0)
+
+    def test_reflection_padding_no_flat_tail(self, tmp_path):
+        """Reflected frames should have non-zero velocity (not flat repeat)."""
+        ds = self._make_ds(tmp_path)
+        kps = np.random.rand(10, NUM_KP, 3).astype(np.float32) * 10
+        result = ds._pad_or_crop(kps)
+        # Velocity between consecutive padded frames should be non-zero
+        tail = result[10:]  # padded region
+        if len(tail) > 1:
+            velocity = np.diff(tail, axis=0)
+            assert np.any(np.abs(velocity) > 0)
+
+    def test_reflection_padding_short_sequence(self, tmp_path):
+        """Reflection padding works for very short sequences."""
+        ds = self._make_ds(tmp_path)
+        kps = np.random.rand(2, NUM_KP, 3).astype(np.float32)
+        result = ds._pad_or_crop(kps)
+        assert result.shape == (16, NUM_KP, 3)
+
+
+# ---------------------------------------------------------------------------
+# Keypoint slicing (543 -> 75)
+# ---------------------------------------------------------------------------
+
+
+class TestKeypointSlicing:
+    def test_543_to_75_slicing(self, tmp_path):
+        """Dataset slices 543-keypoint .npy files to 75 at load time."""
+        kp_dir = tmp_path / "kps"
+        kp_dir.mkdir()
+        df = pd.DataFrame({
+            "video_id": ["v0"],
+            "label_idx": [0],
+            "gloss": ["test"],
+        })
+        csv = tmp_path / "split.csv"
+        df.to_csv(csv, index=False)
+        # Save 543-keypoint file
+        kps = np.random.rand(20, 543, 3).astype(np.float32)
+        np.save(str(kp_dir / "v0.npy"), kps)
+
+        ds = WLASLKeypointDataset(csv, kp_dir, T=16, use_motion=False)
+        tensor, _ = ds[0]
+        # Should be 75 * 3 = 225 features (not 543 * 3 = 1629)
+        assert tensor.shape == (16, 75 * 3)
 
 
 # ---------------------------------------------------------------------------

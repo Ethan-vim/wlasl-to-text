@@ -28,6 +28,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from src.data.augment import KeypointHorizontalFlip, get_val_transforms
 from src.data.preprocess import (
     NUM_KEYPOINTS,
     _import_mediapipe_drawing,
@@ -87,6 +88,23 @@ class FrameBuffer:
         with self._lock:
             self._buffer.clear()
 
+    def trim_to(self, n: int) -> None:
+        """Keep only the most recent *n* frames, discarding older ones.
+
+        Used for pre-trigger buffering: when signing starts, retain a few
+        seconds of pre-sign context (sign onset) instead of clearing
+        everything. If the buffer has fewer than *n* frames, nothing
+        is removed.
+
+        Parameters
+        ----------
+        n : int
+            Maximum number of frames to retain.
+        """
+        with self._lock:
+            while len(self._buffer) > n:
+                self._buffer.popleft()
+
 
 # ---------------------------------------------------------------------------
 # Motion detector
@@ -99,10 +117,16 @@ class MotionDetector:
     Uses a state machine (IDLE -> SIGNING -> COMPLETED) to determine
     when a sign has been completed before triggering inference.
 
+    All velocity comparisons are in **normalized-coordinates per second**,
+    making them independent of camera FPS.  The detector measures the
+    actual time delta between ``update()`` calls and divides displacement
+    by dt to get a consistent velocity regardless of whether the camera
+    runs at 30fps, 60fps, or anything in between.
+
     Parameters
     ----------
     cfg : Config
-        Configuration with motion detection thresholds.
+        Configuration with motion detection thresholds (per-second units).
     """
 
     # Hand keypoint indices in the 543-keypoint array (left: 33-53, right: 54-74)
@@ -110,30 +134,24 @@ class MotionDetector:
     HAND_END = 75
 
     def __init__(self, cfg: "Config") -> None:
-        self.start_threshold = cfg.motion_start_threshold
-        self.end_threshold = cfg.motion_end_threshold
-        self.settle_frames = cfg.motion_settle_frames
-        self.max_duration = cfg.max_sign_duration
-        self.static_timeout = cfg.static_sign_timeout
+        self.start_threshold = cfg.motion_start_threshold  # norm-coords/sec
+        self.end_threshold = cfg.motion_end_threshold  # norm-coords/sec
+        self.settle_duration = getattr(cfg, "motion_settle_time", 0.27)  # seconds
+        self.max_duration = cfg.max_sign_duration  # seconds
 
         self._state = "IDLE"
         self._prev_hand_kps: Optional[np.ndarray] = None
-        self._signing_frames = 0
-        self._settle_count = 0
-        self._idle_frames = 0
+        self._last_update_time: Optional[float] = None
+        self._signing_elapsed: float = 0.0
+        self._settle_elapsed: float = 0.0
 
     @property
     def state(self) -> str:
         """Current state: IDLE, SIGNING, or COMPLETED."""
         return self._state
 
-    @property
-    def idle_duration(self) -> int:
-        """Number of consecutive idle frames."""
-        return self._idle_frames
-
-    def _hand_velocity(self, keypoints: np.ndarray) -> float:
-        """Compute mean L2 velocity of hand keypoints from previous frame.
+    def _hand_displacement(self, keypoints: np.ndarray) -> float:
+        """Compute mean L2 displacement of hand keypoints from previous frame.
 
         Parameters
         ----------
@@ -143,9 +161,18 @@ class MotionDetector:
         Returns
         -------
         float
-            Mean L2 displacement across the 42 hand keypoints.
+            Mean L2 displacement across the 42 hand keypoints
+            (normalized-coordinate units, NOT per second).
         """
         hand_kps = keypoints[self.HAND_START:self.HAND_END]
+
+        # Skip frames where hands weren't detected (all zeros) to avoid
+        # false velocity spikes that incorrectly trigger SIGNING state.
+        hand_norm = np.linalg.norm(hand_kps, axis=1).sum()
+        if hand_norm < 1e-6:
+            self._prev_hand_kps = None
+            return 0.0
+
         if self._prev_hand_kps is None:
             self._prev_hand_kps = hand_kps.copy()
             return 0.0
@@ -153,41 +180,58 @@ class MotionDetector:
         self._prev_hand_kps = hand_kps.copy()
         return float(np.mean(displacement))
 
-    def update(self, keypoints: np.ndarray) -> str:
+    def update(self, keypoints: np.ndarray, dt: Optional[float] = None) -> str:
         """Ingest a new frame and return the current state.
+
+        Measures wall-clock time between calls to convert displacement
+        into velocity (norm-coords/second), so thresholds behave
+        identically on any camera FPS.
 
         Parameters
         ----------
         keypoints : np.ndarray
             Shape ``(NUM_KEYPOINTS, 3)`` for the latest frame.
+        dt : float or None
+            Override time delta in seconds (for testing).  When None,
+            wall-clock time is measured automatically.
 
         Returns
         -------
         str
             Current state after processing: IDLE, SIGNING, or COMPLETED.
         """
-        vel = self._hand_velocity(keypoints)
+        if dt is None:
+            now = time.monotonic()
+            if self._last_update_time is not None:
+                dt = now - self._last_update_time
+            else:
+                dt = 0.0
+            self._last_update_time = now
+
+        # Clamp dt to avoid spikes from pauses or first-frame artifacts
+        dt = max(min(dt, 0.5), 0.0)
+
+        displacement = self._hand_displacement(keypoints)
+
+        # Convert displacement-per-frame to velocity-per-second
+        vel = displacement / dt if dt > 0 else 0.0
 
         if self._state == "IDLE":
             if vel >= self.start_threshold:
                 self._state = "SIGNING"
-                self._signing_frames = 1
-                self._settle_count = 0
-                self._idle_frames = 0
-            else:
-                self._idle_frames += 1
+                self._signing_elapsed = 0.0
+                self._settle_elapsed = 0.0
 
         elif self._state == "SIGNING":
-            self._signing_frames += 1
-
+            self._signing_elapsed += dt
             if vel < self.end_threshold:
-                self._settle_count += 1
+                self._settle_elapsed += dt
             else:
-                self._settle_count = 0
+                self._settle_elapsed = 0.0
 
-            if self._settle_count >= self.settle_frames:
+            if self._settle_elapsed >= self.settle_duration:
                 self._state = "COMPLETED"
-            elif self._signing_frames >= self.max_duration:
+            elif self._signing_elapsed >= self.max_duration:
                 self._state = "COMPLETED"
 
         return self._state
@@ -196,9 +240,8 @@ class MotionDetector:
         """Reset to IDLE state and clear all history."""
         self._state = "IDLE"
         self._prev_hand_kps = None
-        self._signing_frames = 0
-        self._settle_count = 0
-        self._idle_frames = 0
+        self._signing_elapsed = 0.0
+        self._settle_elapsed = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +291,9 @@ class LivePredictor:
             self._load_prototypes(cfg)
 
         self._use_classify = hasattr(self.model, 'classify')
+        self.transform = get_val_transforms(T=cfg.T)
+        self._use_tta = getattr(cfg, "use_tta", False)
+        self._hflip = KeypointHorizontalFlip(p=1.0, centered=True)
 
         # MediaPipe — uses shared helper that handles Windows/Python 3.12 fallback
         self._mp_holistic = _import_mediapipe_holistic()
@@ -256,9 +302,9 @@ class LivePredictor:
         self._mp_drawing_styles = styles_mod
         self.holistic = self._mp_holistic.Holistic(
             static_image_mode=False,
-            model_complexity=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
+            model_complexity=2,
+            min_detection_confidence=0.3,
+            min_tracking_confidence=0.3,
         )
 
         logger.info("LivePredictor initialized (device=%s)", self.device)
@@ -342,33 +388,58 @@ class LivePredictor:
         dict or None
             Prediction result or None if buffer is too short.
         """
-        keypoints = buffer.get_all()  # (N, 543, 3)
+        keypoints = buffer.get_all()  # (N, NUM_KEYPOINTS, 3)
 
         min_frames = getattr(self.cfg, "min_buffer_frames", 30)
         if keypoints.shape[0] < min_frames:
+            logger.debug("Buffer too short: %d < %d", keypoints.shape[0], min_frames)
             return None
+
+        # Check pose detection quality: shoulders (landmarks 11, 12) must be
+        # detected for normalize_keypoints to produce valid output.  Without
+        # shoulders, centering/scaling is undefined and the model gets garbage.
+        shoulder_kps = keypoints[:, [11, 12], :]  # (N, 2, 3)
+        shoulder_norms = np.linalg.norm(shoulder_kps.reshape(keypoints.shape[0], -1), axis=1)
+        pose_detected_frac = float(np.mean(shoulder_norms > 1e-6))
+        if pose_detected_frac < 0.3:
+            logger.debug(
+                "Poor pose detection: %.0f%% of frames have shoulders — skipping inference",
+                pose_detected_frac * 100,
+            )
+            return None
+
+        # Check hand detection quality
+        hand_kps = keypoints[:, 33:75, :]  # left + right hand
+        hand_norms = np.linalg.norm(hand_kps.reshape(keypoints.shape[0], -1), axis=1)
+        hand_detected_frac = float(np.mean(hand_norms > 1e-6))
+        logger.debug(
+            "Buffer: %d frames, pose: %.0f%%, hands: %.0f%%",
+            keypoints.shape[0], pose_detected_frac * 100, hand_detected_frac * 100,
+        )
 
         # Normalize
         keypoints = normalize_keypoints(keypoints)
 
-        # Pad/crop to T frames
-        T = self.cfg.T
-        N = keypoints.shape[0]  # real frame count before padding
-        if N < T:
-            pad = np.tile(keypoints[-1:], (T - N, 1, 1))
-            keypoints = np.concatenate([keypoints, pad], axis=0)
-        elif N > T:
-            indices = np.linspace(0, N - 1, T, dtype=np.int64)
-            keypoints = keypoints[indices]
+        # Drop face landmarks: keep only pose (33) + left hand (21) + right hand (21) = 75
+        keypoints = keypoints[:, :75, :]
+
+        # Apply val transforms (temporal crop/pad to T frames) — matches eval pipeline
+        keypoints = self.transform(keypoints)
+
+        # Ensure 3D: (T, K, 3)
+        if keypoints.ndim == 2:
+            T_actual = keypoints.shape[0]
+            keypoints = keypoints.reshape(T_actual, -1, 3)
 
         # Compute velocity if use_motion is enabled
         if getattr(self.cfg, "use_motion", False):
             velocity = np.zeros_like(keypoints)
             velocity[1:] = keypoints[1:] - keypoints[:-1]
-            keypoints = np.concatenate([keypoints, velocity], axis=-1)  # (T, 543, 6)
+            keypoints = np.concatenate([keypoints, velocity], axis=-1)  # (T, 75, 6)
 
         # Flatten and convert to tensor
-        keypoints_flat = keypoints.reshape(T, -1)  # (T, 543*C)
+        T = keypoints.shape[0]
+        keypoints_flat = keypoints.reshape(T, -1)  # (T, 75*C)
         tensor = torch.from_numpy(keypoints_flat).float().unsqueeze(0).to(self.device)
 
         with torch.no_grad():
@@ -376,22 +447,40 @@ class LivePredictor:
                 logits = self.model.classify(tensor)
             else:
                 logits = self.model(tensor)
+
+            # Test-Time Augmentation: average logits with horizontal flip
+            if self._use_tta and keypoints.ndim == 3:
+                C_feat = keypoints.shape[2]
+                if C_feat == 6:
+                    # Split position/velocity, flip each separately (match evaluate.py)
+                    pos = keypoints[:, :, :3].copy()
+                    vel = keypoints[:, :, 3:].copy()
+                    pos_flip = self._hflip(pos)
+                    vel_flip = self._hflip(vel)
+                    kps_flipped = np.concatenate([pos_flip, vel_flip], axis=-1)
+                else:
+                    kps_flipped = self._hflip(keypoints.copy())
+                flipped_flat = kps_flipped.reshape(T, -1)
+                flipped_tensor = torch.from_numpy(flipped_flat).float().unsqueeze(0).to(self.device)
+                if self._use_classify:
+                    logits_flip = self.model.classify(flipped_tensor)
+                else:
+                    logits_flip = self.model(flipped_tensor)
+                logits = (logits + logits_flip) / 2.0
+
             probs = F.softmax(logits, dim=1).squeeze(0)
 
         top5_probs, top5_indices = probs.topk(5)
         top5_probs = top5_probs.cpu().numpy()
         top5_indices = top5_indices.cpu().numpy()
 
-        # Scale confidence by buffer fill ratio to penalize partial sequences
-        buffer_fill_ratio = min(1.0, N / T)
-
         pred_idx = int(top5_indices[0])
-        confidence = float(top5_probs[0]) * buffer_fill_ratio
+        confidence = float(top5_probs[0])
         gloss = self.class_names[pred_idx] if pred_idx < len(self.class_names) else str(pred_idx)
         top5 = [
             (
                 self.class_names[int(i)] if int(i) < len(self.class_names) else str(i),
-                float(p) * buffer_fill_ratio,
+                float(p),
             )
             for i, p in zip(top5_indices, top5_probs)
         ]
@@ -401,7 +490,6 @@ class LivePredictor:
             "confidence": confidence,
             "label_idx": pred_idx,
             "top5": top5,
-            "buffer_fill_ratio": buffer_fill_ratio,
         }
 
     @staticmethod
@@ -679,6 +767,22 @@ def run_demo(
                     class_names[idx] = row["gloss"]
             break
 
+    # Open webcam early so we can query its FPS for buffer sizing
+    cap = cv2.VideoCapture(camera_id)
+    if not cap.isOpened():
+        logger.error("Cannot open camera %d", camera_id)
+        return
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    camera_fps = cap.get(cv2.CAP_PROP_FPS)
+    if camera_fps <= 0:
+        camera_fps = 30.0  # fallback if driver doesn't report FPS
+    logger.info("Camera FPS: %.1f", camera_fps)
+
+    pre_sign_dur = getattr(cfg, "pre_sign_duration", 0.5)
+    pre_sign_frames = int(pre_sign_dur * camera_fps)
+    logger.info("Pre-sign buffer: %d frames (%.1fs)", pre_sign_frames, pre_sign_dur)
+
     # Initialize components
     predictor = LivePredictor(
         checkpoint_path=checkpoint_path,
@@ -686,7 +790,11 @@ def run_demo(
         device=device,
         class_names=class_names,
     )
-    buffer = FrameBuffer(max_size=cfg.buffer_size)
+    # Buffer holds max_sign_duration seconds of frames.  TemporalCrop then
+    # uniformly samples down to T, matching the training pipeline.
+    max_sign_sec = getattr(cfg, "max_sign_duration", 3.0)
+    buffer_frames = int(max_sign_sec * camera_fps) + 10  # small margin
+    buffer = FrameBuffer(max_size=buffer_frames)
     display = ASLDisplay()
 
     # State
@@ -707,9 +815,14 @@ def run_demo(
     # FPS tracking
     frame_times: collections.deque[float] = collections.deque(maxlen=30)
 
+    # Prediction display expiry
+    prediction_time: float = 0.0
+    prediction_display_timeout: float = 3.0  # seconds before clearing stale prediction
+
     # Inference thread — motion-aware with cooldown
     def inference_loop() -> None:
         nonlocal current_prediction, current_confidence, current_top5, recent_predictions
+        nonlocal prediction_time
         cooldown_until = 0.0
         poll_interval = getattr(cfg, "inference_poll_interval", 0.1)
 
@@ -727,20 +840,11 @@ def run_demo(
             # Read motion state (set by main thread)
             with motion_lock:
                 state = current_motion_state
-                idle_dur = motion_detector.idle_duration
-            buf_len = len(buffer)
 
-            # Decide whether to run inference
-            should_infer = False
-            if state == "COMPLETED":
-                should_infer = True
-            elif buf_len >= cfg.buffer_size:
-                should_infer = True
-            elif state == "IDLE" and buf_len >= getattr(cfg, "min_buffer_frames", 30):
-                if idle_dur >= getattr(cfg, "static_sign_timeout", 45):
-                    should_infer = True
-
-            if not should_infer:
+            # Only infer after the user has actually signed: the state
+            # machine must go IDLE → SIGNING → COMPLETED before we run
+            # the model.  This prevents spurious predictions on idle frames.
+            if state != "COMPLETED":
                 continue
 
             result = predictor.predict_buffer(buffer)
@@ -753,34 +857,36 @@ def run_demo(
                     recent_predictions = recent_predictions[-cfg.smoothing_window:]
 
                 smoothed = predictor.smooth_predictions(recent_predictions, mode="avg")
+
                 if smoothed is not None and smoothed["confidence"] >= cfg.confidence_threshold:
+                    # High confidence — commit prediction and reset for next sign
                     current_prediction = smoothed
                     current_confidence = smoothed["confidence"]
                     current_top5 = smoothed.get("top5")
+                    prediction_time = now
 
-                    # Post-prediction cooldown
                     buffer.clear()
                     with motion_lock:
                         motion_detector.reset()
                     recent_predictions.clear()
                     cooldown_until = now + getattr(cfg, "prediction_cooldown", 1.0)
+
                 else:
-                    current_prediction = None
-                    current_confidence = 0.0
-                    current_top5 = None
+                    # Low confidence on a completed/idle sign — show result
+                    # but use a shorter cooldown so the user can retry sooner.
+                    if smoothed is not None:
+                        current_prediction = smoothed
+                        current_confidence = smoothed["confidence"]
+                        current_top5 = smoothed.get("top5")
+                        prediction_time = now
+                    buffer.clear()
+                    with motion_lock:
+                        motion_detector.reset()
+                    recent_predictions.clear()
+                    cooldown_until = now + getattr(cfg, "prediction_cooldown", 1.0) * 0.3
 
     inference_thread = threading.Thread(target=inference_loop, daemon=True)
     inference_thread.start()
-
-    # Open webcam
-    cap = cv2.VideoCapture(camera_id)
-    if not cap.isOpened():
-        logger.error("Cannot open camera %d", camera_id)
-        running = False
-        return
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     print("ASL Recognition Demo started. Press 'q' to quit, 's' to save prediction.")
 
@@ -795,14 +901,28 @@ def run_demo(
 
             # Extract keypoints and feed motion detector
             kps, mp_results = predictor.preprocess_frame(frame)
-            buffer.push(kps)
             with motion_lock:
+                prev_state = motion_detector.state
                 m_state = motion_detector.update(kps)
                 current_motion_state = m_state
+                # Trim idle frames when signing begins — keep only
+                # pre_sign_frames of context so the model sees sign onset
+                # (preparation phase). Training data includes full videos
+                # with prep frames; discarding them all creates a mismatch.
+                if prev_state == "IDLE" and m_state == "SIGNING":
+                    buffer.trim_to(pre_sign_frames)
+            buffer.push(kps)
             last_mp_results = mp_results
 
             # Get current prediction (thread-safe read)
             with inference_lock:
+                # Expire stale predictions so display reverts to "Waiting..."
+                if (current_prediction is not None
+                        and prediction_time > 0
+                        and (time.time() - prediction_time) > prediction_display_timeout):
+                    current_prediction = None
+                    current_confidence = 0.0
+                    current_top5 = None
                 pred_copy = current_prediction
                 conf_copy = current_confidence
                 top5_copy = current_top5
@@ -830,6 +950,19 @@ def run_demo(
                     0.6,
                     (0, 255, 0),
                     2,
+                    cv2.LINE_AA,
+                )
+
+            # Body detection warning
+            if mp_results is not None and not mp_results.pose_landmarks:
+                cv2.putText(
+                    frame,
+                    "No body detected - adjust position/lighting",
+                    (20, frame.shape[0] - 50),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 0, 255),
+                    1,
                     cv2.LINE_AA,
                 )
 

@@ -40,8 +40,20 @@ def train_one_epoch(
     epoch: int = 0,
     writer: Optional[object] = None,
     global_step: int = 0,
+    scheduler: Optional[object] = None,
+    step_scheduler_per_batch: bool = False,
 ) -> tuple[float, float, int]:
     """Train for one epoch of batches.
+
+    Parameters
+    ----------
+    scheduler : optional
+        Learning rate scheduler.  When *step_scheduler_per_batch* is True
+        the scheduler is stepped after every optimizer step (required for
+        OneCycleLR).
+    step_scheduler_per_batch : bool
+        If True, call ``scheduler.step()`` after each batch instead of
+        once per epoch.
 
     Returns
     -------
@@ -55,6 +67,7 @@ def train_one_epoch(
 
     non_blocking = device.type == "cuda"
     use_mixup = cfg.mixup_alpha > 0
+    use_aux = getattr(cfg, "aux_loss_weight", 0.0) > 0
     pbar = tqdm(loader, desc=f"Train Epoch {epoch}", leave=False, dynamic_ncols=True)
 
     for batch_x, batch_y in pbar:
@@ -67,6 +80,12 @@ def train_one_epoch(
             mixed_x, y_a, y_b, lam = mixup_data(batch_x, batch_y, cfg.mixup_alpha)
             logits = model(mixed_x)
             loss = mixup_criterion(criterion, logits, y_a, y_b, lam)
+        elif use_aux:
+            logits, aux_logits_list = model.forward_with_aux(batch_x)
+            loss = criterion(logits, batch_y)
+            if aux_logits_list:
+                aux_loss = sum(criterion(aux_lg, batch_y) for aux_lg in aux_logits_list) / len(aux_logits_list)
+                loss = loss + cfg.aux_loss_weight * aux_loss
         else:
             logits = model(batch_x)
             loss = criterion(logits, batch_y)
@@ -76,7 +95,11 @@ def train_one_epoch(
             nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
 
-        # MPS queues Metal commands asynchronously — flush every step to
+        # Step per-batch scheduler (e.g. OneCycleLR)
+        if step_scheduler_per_batch and scheduler is not None:
+            scheduler.step()
+
+        # MPS queues Metal commands asynchronously -- flush every step to
         # prevent the command queue from filling up and stalling.
         if device.type == "mps":
             torch.mps.synchronize()
@@ -296,20 +319,36 @@ def main(cfg: Config, device_override: str | None = None) -> None:
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
     )
 
-    # Scheduler: linear warmup → cosine annealing
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.01, total_iters=max(cfg.warmup_epochs, 1),
-    )
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(cfg.epochs - cfg.warmup_epochs, 1),
-        eta_min=cfg.lr * 0.01,
-    )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[cfg.warmup_epochs],
-    )
+    # Scheduler
+    step_scheduler_per_batch = False
+    if getattr(cfg, "scheduler", "cosine") == "onecycle":
+        steps_per_epoch = len(train_loader)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=cfg.lr,
+            epochs=cfg.epochs,
+            steps_per_epoch=steps_per_epoch,
+            pct_start=cfg.warmup_epochs / max(cfg.epochs, 1),
+            anneal_strategy="cos",
+        )
+        step_scheduler_per_batch = True
+        logger.info("Using OneCycleLR scheduler (steps_per_epoch=%d)", steps_per_epoch)
+    else:
+        # Linear warmup then cosine annealing (per-epoch stepping)
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, total_iters=max(cfg.warmup_epochs, 1),
+        )
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(cfg.epochs - cfg.warmup_epochs, 1),
+            eta_min=cfg.lr * 0.01,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[cfg.warmup_epochs],
+        )
+        logger.info("Using cosine scheduler with linear warmup")
 
     # Resume
     start_epoch = 0
@@ -341,9 +380,12 @@ def main(cfg: Config, device_override: str | None = None) -> None:
             train_loss, train_acc, global_step = train_one_epoch(
                 model, train_loader, optimizer, criterion, device, cfg,
                 epoch=epoch, writer=writer, global_step=global_step,
+                scheduler=scheduler, step_scheduler_per_batch=step_scheduler_per_batch,
             )
 
-            scheduler.step()
+            # Step per-epoch schedulers (cosine). OneCycleLR is stepped per batch.
+            if not step_scheduler_per_batch:
+                scheduler.step()
 
             val_loss, val_top1, val_top5 = validate(
                 model, val_loader, criterion, device,

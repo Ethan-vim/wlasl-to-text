@@ -4,7 +4,7 @@
 
 approach: stgcn_proto
 wlasl_variant: 100
-num_keypoints: 543
+num_keypoints: 75
 T: 64
 use_motion: true
 
@@ -34,7 +34,7 @@ scheduler: cosine
 num_workers: 4
 
 # Evaluation
-use_tta: false
+use_tta: true
 
 # Logging
 use_wandb: false
@@ -47,15 +47,15 @@ smoothing_window: 5
 buffer_size: 64
 fps_display: true
 
-# Sign detection
+# Sign detection (thresholds in normalized-coords/second, FPS-independent)
 min_buffer_frames: 30
 prediction_cooldown: 1.0
-motion_start_threshold: 0.005
-motion_end_threshold: 0.003
-motion_settle_frames: 8
-max_sign_duration: 90
-static_sign_timeout: 45
+motion_start_threshold: 0.30
+motion_end_threshold: 0.10
+motion_settle_time: 0.27
+max_sign_duration: 3.0
 inference_poll_interval: 0.1
+pre_sign_duration: 0.5
 
 # Paths
 data_dir: data

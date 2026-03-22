@@ -60,6 +60,36 @@ class TestFrameBuffer:
         assert result[0, 0, 0] == 2.0
         assert result[-1, 0, 0] == 4.0
 
+    def test_trim_to_keeps_recent(self):
+        """trim_to(n) keeps the n most recent frames."""
+        buf = FrameBuffer(max_size=20)
+        for i in range(10):
+            frame = np.full((NUM_KP, 3), float(i), dtype=np.float32)
+            buf.push(frame)
+        buf.trim_to(3)
+        assert len(buf) == 3
+        result = buf.get_all()
+        # Should keep frames 7, 8, 9 (the 3 most recent)
+        assert result[0, 0, 0] == 7.0
+        assert result[1, 0, 0] == 8.0
+        assert result[2, 0, 0] == 9.0
+
+    def test_trim_to_noop_when_smaller(self):
+        """trim_to(n) does nothing when buffer has fewer than n frames."""
+        buf = FrameBuffer(max_size=20)
+        for _ in range(3):
+            buf.push(np.random.rand(NUM_KP, 3).astype(np.float32))
+        buf.trim_to(10)
+        assert len(buf) == 3
+
+    def test_trim_to_zero_clears(self):
+        """trim_to(0) removes all frames."""
+        buf = FrameBuffer(max_size=10)
+        for _ in range(5):
+            buf.push(np.random.rand(NUM_KP, 3).astype(np.float32))
+        buf.trim_to(0)
+        assert len(buf) == 0
+
 
 # ---------------------------------------------------------------------------
 # LivePredictor.smooth_predictions (static method)
@@ -112,17 +142,28 @@ class TestSmoothPredictions:
 
 @dataclass
 class _MockCfg:
-    """Minimal config for MotionDetector tests."""
-    motion_start_threshold: float = 0.005
-    motion_end_threshold: float = 0.003
-    motion_settle_frames: int = 8
-    max_sign_duration: int = 90
-    static_sign_timeout: int = 45
+    """Minimal config for MotionDetector tests.
+
+    Thresholds are in normalized-coordinates per second (FPS-independent).
+    Durations are in seconds.
+    """
+    motion_start_threshold: float = 0.30   # norm-coords/sec
+    motion_end_threshold: float = 0.10     # norm-coords/sec
+    motion_settle_time: float = 0.27       # seconds
+    max_sign_duration: float = 3.0         # seconds
 
 
 def _still_frame():
-    """Return a keypoint frame with no motion (zeros)."""
-    return np.zeros((NUM_KP, 3), dtype=np.float32)
+    """Return a keypoint frame with hands present but no motion.
+
+    Hand keypoints are non-zero so the motion detector treats them
+    as valid detections (zero hand keypoints are skipped as detection
+    failures).
+    """
+    kps = np.zeros((NUM_KP, 3), dtype=np.float32)
+    # Set hand keypoints to a small constant so they pass the zero check
+    kps[33:75, :] = 0.001
+    return kps
 
 
 def _moving_frame(magnitude: float = 0.05):
@@ -134,77 +175,76 @@ def _moving_frame(magnitude: float = 0.05):
 
 
 class TestMotionDetector:
+    # Simulate 30fps camera — each frame advances 1/30 second
+    DT = 1.0 / 30.0
+
     def test_initial_state_is_idle(self):
         md = MotionDetector(_MockCfg())
         assert md.state == "IDLE"
-
-    def test_idle_duration_increments(self):
-        md = MotionDetector(_MockCfg())
-        frame = _still_frame()
-        for _ in range(10):
-            md.update(frame)
-        assert md.idle_duration >= 9  # first frame sets prev, subsequent ones count
-
-    def test_detects_sign_start(self):
-        md = MotionDetector(_MockCfg())
-        # First frame: set baseline
-        md.update(_still_frame())
-        # Second frame: large hand displacement triggers SIGNING
-        md.update(_moving_frame(0.05))
-        assert md.state == "SIGNING"
-
-    def test_detects_sign_end(self):
-        cfg = _MockCfg(motion_settle_frames=3)
-        md = MotionDetector(cfg)
-        # Start signing
-        md.update(_still_frame())
-        md.update(_moving_frame(0.05))
-        assert md.state == "SIGNING"
-
-        # Settle: send identical still frames (zero velocity)
-        still = _still_frame()
-        for _ in range(4):
-            md.update(still)
-        assert md.state == "COMPLETED"
-
-    def test_max_sign_duration_forces_completed(self):
-        cfg = _MockCfg(max_sign_duration=5)
-        md = MotionDetector(cfg)
-        # Start signing
-        md.update(_still_frame())
-        md.update(_moving_frame(0.05))
-        assert md.state == "SIGNING"
-
-        # Keep signing for max_duration frames with continuous motion
-        for i in range(5):
-            md.update(_moving_frame(0.05 + i * 0.01))
-        assert md.state == "COMPLETED"
-
-    def test_reset_returns_to_idle(self):
-        md = MotionDetector(_MockCfg())
-        md.update(_still_frame())
-        md.update(_moving_frame(0.05))
-        assert md.state == "SIGNING"
-        md.reset()
-        assert md.state == "IDLE"
-        assert md.idle_duration == 0
-
-    def test_velocity_uses_hand_keypoints(self):
-        """Only hand keypoints (33-74) should contribute to velocity."""
-        md = MotionDetector(_MockCfg())
-        # First frame: all zeros
-        md.update(_still_frame())
-
-        # Second frame: only body keypoints (0-32) move, hands stay still
-        frame = _still_frame()
-        frame[:33, :] = 0.1  # body moves
-        state = md.update(frame)
-        # Should remain IDLE since hands didn't move
-        assert state == "IDLE"
 
     def test_stays_idle_with_no_motion(self):
         md = MotionDetector(_MockCfg())
         still = _still_frame()
         for _ in range(20):
-            md.update(still)
+            md.update(still, dt=self.DT)
         assert md.state == "IDLE"
+
+    def test_detects_sign_start(self):
+        md = MotionDetector(_MockCfg())
+        # First frame: set baseline
+        md.update(_still_frame(), dt=self.DT)
+        # Second frame: large hand displacement triggers SIGNING
+        # displacement ≈ 0.049, vel = 0.049 / (1/30) ≈ 1.47 > 0.30
+        md.update(_moving_frame(0.05), dt=self.DT)
+        assert md.state == "SIGNING"
+
+    def test_detects_sign_end(self):
+        # Use short settle time: 0.08s → 3 frames at 30fps (3/30 = 0.10 > 0.08)
+        cfg = _MockCfg(motion_settle_time=0.08)
+        md = MotionDetector(cfg)
+        # Start signing
+        md.update(_still_frame(), dt=self.DT)
+        md.update(_moving_frame(0.05), dt=self.DT)
+        assert md.state == "SIGNING"
+
+        # Settle: send identical still frames (zero velocity)
+        still = _still_frame()
+        for _ in range(4):
+            md.update(still, dt=self.DT)
+        assert md.state == "COMPLETED"
+
+    def test_max_sign_duration_forces_completed(self):
+        # 0.1s max duration → completes after ~3 frames at 30fps
+        cfg = _MockCfg(max_sign_duration=0.1)
+        md = MotionDetector(cfg)
+        # Start signing
+        md.update(_still_frame(), dt=self.DT)
+        md.update(_moving_frame(0.05), dt=self.DT)
+        assert md.state == "SIGNING"
+
+        # Keep signing with continuous motion (increasing magnitude → non-zero
+        # displacement each frame so velocity stays above end_threshold)
+        for i in range(5):
+            md.update(_moving_frame(0.06 + i * 0.01), dt=self.DT)
+        assert md.state == "COMPLETED"
+
+    def test_reset_returns_to_idle(self):
+        md = MotionDetector(_MockCfg())
+        md.update(_still_frame(), dt=self.DT)
+        md.update(_moving_frame(0.05), dt=self.DT)
+        assert md.state == "SIGNING"
+        md.reset()
+        assert md.state == "IDLE"
+
+    def test_velocity_uses_hand_keypoints(self):
+        """Only hand keypoints (33-74) should contribute to velocity."""
+        md = MotionDetector(_MockCfg())
+        # First frame: all zeros
+        md.update(_still_frame(), dt=self.DT)
+
+        # Second frame: only body keypoints (0-32) move, hands stay still
+        frame = _still_frame()
+        frame[:33, :] = 0.1  # body moves
+        state = md.update(frame, dt=self.DT)
+        # Should remain IDLE since hands didn't move
+        assert state == "IDLE"

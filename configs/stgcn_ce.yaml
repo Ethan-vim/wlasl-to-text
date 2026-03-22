@@ -6,10 +6,9 @@
 approach: stgcn_ce
 wlasl_variant: 100
 # num_classes is auto-derived from wlasl_variant (100 -> 100, 300 -> 300, etc.)
-num_keypoints: 543
+num_keypoints: 75
 T: 64
 use_motion: true
-use_augmentation: true
 
 # Model (ST-GCN encoder)
 d_model: 128
@@ -20,14 +19,14 @@ embedding_dim: 128
 normalize_embeddings: false
 
 # Cross-entropy training
-label_smoothing: 0.0
-mixup_alpha: 0.0
+label_smoothing: 0.1
+mixup_alpha: 0.2
 head_dropout: 0.2
 class_weighted_loss: true
 
 # Training
 epochs: 200
-batch_size: 64
+batch_size: 32
 lr: 1.0e-03
 weight_decay: 1.0e-04
 warmup_epochs: 10
@@ -39,20 +38,21 @@ scheduler: cosine
 num_workers: 8
 
 # Inference
+use_tta: true
 confidence_threshold: 0.6
 smoothing_window: 5
 buffer_size: 64
 fps_display: true
 
-# Sign detection
+# Sign detection (thresholds in normalized-coords/second, FPS-independent)
 min_buffer_frames: 30
 prediction_cooldown: 1.0
-motion_start_threshold: 0.005
-motion_end_threshold: 0.003
-motion_settle_frames: 8
-max_sign_duration: 90
-static_sign_timeout: 45
+motion_start_threshold: 0.30
+motion_end_threshold: 0.10
+motion_settle_time: 0.27
+max_sign_duration: 3.0
 inference_poll_interval: 0.1
+pre_sign_duration: 0.5
 
 # Paths
 data_dir: data

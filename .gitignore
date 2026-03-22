@@ -61,3 +61,5 @@ wandb/
 
 # Others
 errors.txt
+*.code-workspace
+INSTRUCTIONS.md

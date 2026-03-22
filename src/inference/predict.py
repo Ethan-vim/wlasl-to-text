@@ -172,6 +172,10 @@ class SignPredictor:
             T = keypoints.shape[0]
             keypoints = keypoints.reshape(T, -1, 3)
 
+        # Drop face landmarks: keep only pose (33) + left hand (21) + right hand (21) = 75
+        if keypoints.shape[1] > 75:
+            keypoints = keypoints[:, :75, :]
+
         # Compute velocity if use_motion is enabled
         if getattr(self.cfg, "use_motion", False):
             velocity = np.zeros_like(keypoints)
